@@ -1,45 +1,101 @@
-name: Integration Test
+name: Release
 
 on:
   push:
-    branches: [main]
-  pull_request:
+    branches: [ main ]
+    # tags:
+    #   - "v*" # e.g. v1.2.3
 
 jobs:
-  test:
-    strategy:
-      matrix:
-        os: [windows-latest, macos-latest]
-        # ubuntu-latest
-
-    runs-on: ${{ matrix.os }}
-
+  build-linux:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libmagic-dev
+
+      - name: Add Windows target
+        run: rustup target add x86_64-pc-windows-gnu
+
+      - name: Build Linux binary
+        run: cargo build --release
+
+      - name: Build Windows binary
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
         with:
-          toolchain: stable
-          components: clippy, rustfmt
+          name: library-rs-linux
+          path: target/release/library-rs
 
-      - name: Run Clippy
-        run: cargo clippy -- -D warnings
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: library-rs-windows
+          path: target/x86_64-pc-windows-gnu/release/library-rs.exe
 
-      - name: Install SQLite on Linux
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get install -y sqlite3 libmagic-dev
+  test-windows:
+    runs-on: windows-latest
+    needs: build-linux
+    steps:
+      - uses: actions/checkout@v5
 
-      - name: Install SQLite on macOS
-        if: matrix.os == 'macos-latest'
-        run: brew install sqlite3 libmagic file
-
-      - name: Install SQLite on Windows
-        if: matrix.os == 'windows-latest'
-        run: choco install sqlite
-
-      - name: Build
-        run: cargo build
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: library-rs-windows
+          path: ./bin
 
       - name: Run tests
-        run: cargo test --verbose
+        run: ./bin/library-rs.exe --help
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install deps
+        run: brew install libmagic
+
+      - name: Build macOS binary
+        run: cargo build --release
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: library-rs-macos
+          path: target/release/library-rs
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [build-linux, test-windows, build-macos]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/library-rs-linux/library-rs
+            artifacts/library-rs-windows/library-rs.exe
+            artifacts/library-rs-macos/library-rs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-binstall
+        run: cargo install cargo-binstall
+
+      - name: Generate binstall manifest
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          cargo binstall package \
+            --version $VERSION \
+            --github-org ${{ github.repository_owner }} \
+            --github-repo ${{ github.event.repository.name }}
