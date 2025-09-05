@@ -1,32 +1,61 @@
-use clap::Parser;
-use magic::cookie::{Flags};
+use clap::{Parser, ValueEnum};
+use crossterm::{cursor, style::Print, terminal, ExecutableCommand, QueueableCommand};
+use magic::cookie::Flags;
 use magic::Cookie;
-use rusqlite::{params_from_iter, Connection, Result, ToSql};
+use rusqlite::{params, Connection, Result};
 use std::fs;
-use std::path::{Path};
-use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
-use std::time::{Instant, UNIX_EPOCH};
+use std::io::{stderr, Write};
+use std::path::Path;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+use std::time::{Duration};
+use tokio::{
+    sync::{mpsc as tokio_mpsc, Semaphore},
+    task::spawn_blocking,
+};
 use walkdir::WalkDir;
+use which::which;
 
-const STAT_THREADS: usize = 32;
 const MAGIC_BATCH_SIZE: usize = 128;
-const SQLITE_BATCH_SIZE: usize = 512;
+const SQLITE_BATCH_SIZE: usize = 32;
+const FILE_CMD_CONCURRENCY: usize = 16;
+const CHANNEL_CAPACITY: usize = 512;
 
-/// static link magic for Windows
+// static link libmagic for Windows
 #[cfg(target_os = "windows")]
 #[link(name = "magic", kind = "static")]
 extern "C" {}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum BackendChoice {
+    File,
+    Magic,
+}
 
 #[derive(Parser, Debug)]
 struct Args {
     #[clap(required = true)]
     db: String,
+
     #[clap(required = true, num_args = 1..)]
     paths: Vec<String>,
+
+    #[clap(long, value_enum)]
+    backend: Option<BackendChoice>,
+
+    #[clap(long, default_value_t = 32)]
+    stat_threads: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+enum MimeBackend {
+    LibMagic,
+    FileCmd,
+}
+
+#[derive(Debug, Clone)]
 struct FileInfo {
     path: String,
     size: u64,
@@ -34,6 +63,10 @@ struct FileInfo {
     time_modified: u64,
     file_type: Option<String>,
 }
+
+static FILES_SCANNED: AtomicUsize = AtomicUsize::new(0);
+static MIME_PROCESSED: AtomicUsize = AtomicUsize::new(0);
+static SQLITE_INSERTED: AtomicUsize = AtomicUsize::new(0);
 
 fn create_table(conn: &Connection) -> Result<()> {
     conn.execute(
@@ -51,175 +84,279 @@ fn create_table(conn: &Connection) -> Result<()> {
 }
 
 fn insert_batch(tx: &rusqlite::Transaction<'_>, batch: &[FileInfo]) -> Result<()> {
-    if batch.is_empty() {
-        return Ok(());
-    }
-
-    let values: Vec<String> = (0..batch.len())
-        .map(|_| "(?, ?, ?, ?, ?)".to_string())
-        .collect();
-    let sql = format!(
-        "INSERT OR REPLACE INTO media (path, size, time_created, time_modified, type) VALUES {}",
-        values.join(", ")
-    );
-
-    let mut params: Vec<&dyn ToSql> = Vec::with_capacity(batch.len() * 5);
+    let mut stmt = tx.prepare(
+        "INSERT OR REPLACE INTO media (path, size, time_created, time_modified, type) VALUES (?, ?, ?, ?, ?)"
+    )?;
     for file in batch {
-        params.push(&file.path);
-        params.push(&file.size);
-        params.push(&file.time_created);
-        params.push(&file.time_modified);
-        params.push(&file.file_type);
+        stmt.execute(params![
+            file.path,
+            file.size,
+            file.time_created,
+            file.time_modified,
+            file.file_type,
+        ])?;
     }
-    tx.execute(&sql, params_from_iter(params))?;
     Ok(())
 }
 
-/// processes batches sequentially
-fn magic_worker(rx: mpsc::Receiver<Vec<FileInfo>>, tx: mpsc::Sender<Vec<FileInfo>>) {
-    let cookie = Cookie::open(Flags::MIME | Flags::PRESERVE_ATIME)
-        .expect("failed to open libmagic")
-        .load(&Default::default())
-        .expect("failed to load magic db");
-
-    let start = Instant::now();
-    let mut total_files = 0;
-
-    for mut batch in rx {
-        for info in &mut batch {
-            info.file_type = cookie.file(&info.path).ok().or_else(|| {
-                Path::new(&info.path)
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| format!("extension/{}", ext))
-            });
+fn detect_backend(choice: Option<BackendChoice>) -> MimeBackend {
+    match choice {
+        Some(BackendChoice::File) => MimeBackend::FileCmd,
+        Some(BackendChoice::Magic) => MimeBackend::LibMagic,
+        None => {
+            if which("file").is_ok() {
+                MimeBackend::FileCmd
+            } else {
+                MimeBackend::LibMagic
+            }
         }
-        total_files += batch.len();
-        tx.send(batch)
-            .expect("sending batch to SQLite inserter failed");
     }
-    println!(
-        "Magic processing finished {} files in {:.2?}",
-        total_files,
-        start.elapsed()
-    );
 }
 
-fn stat_worker(
-    entry_rx: Arc<Mutex<mpsc::Receiver<walkdir::DirEntry>>>,
-    batch_tx: mpsc::Sender<Vec<FileInfo>>,
+async fn mime_worker_file_async(
+    mut rx: tokio_mpsc::Receiver<Vec<FileInfo>>,
+    tx: tokio_mpsc::Sender<Vec<FileInfo>>,
 ) {
-    let mut batch = Vec::with_capacity(MAGIC_BATCH_SIZE);
-    while let Ok(entry) = entry_rx.lock().unwrap().recv() {
-        if let Ok(metadata) = fs::metadata(entry.path()) {
-            if metadata.is_file() {
-                let info = FileInfo {
-                    path: fs::canonicalize(entry.path())
-                        .unwrap_or_else(|_| entry.path().to_path_buf())
-                        .to_string_lossy()
-                        .to_string(),
-                    size: metadata.len(),
-                    time_created: metadata
-                        .created()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map_or(0, |d| d.as_secs()),
-                    time_modified: metadata
-                        .modified()
-                        .ok()
-                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                        .map_or(0, |d| d.as_secs()),
-                    file_type: None,
-                };
-                batch.push(info);
+    let sem = Arc::new(Semaphore::new(FILE_CMD_CONCURRENCY));
+    while let Some(batch) = rx.recv().await {
+        for info in batch {
+            let tx_clone = tx.clone();
+            let sem_clone = sem.clone();
+            tokio::spawn(async move {
+                let _permit = sem_clone.acquire().await.unwrap();
+                let result = spawn_blocking(move || {
+                    let mut info = info;
+                    if let Ok(output) = std::process::Command::new("file")
+                        .arg("-bi")
+                        .arg(&info.path)
+                        .output()
+                    {
+                        if let Ok(mime) = String::from_utf8(output.stdout) {
+                            info.file_type = Some(mime.trim().to_string());
+                        }
+                    }
+                    info
+                })
+                .await
+                .unwrap();
+                MIME_PROCESSED.fetch_add(1, Ordering::Relaxed);
+                let _ = tx_clone.send(vec![result]).await;
+            });
+        }
+    }
+}
 
-                if batch.len() >= MAGIC_BATCH_SIZE {
-                    batch_tx.send(batch).unwrap();
-                    batch = Vec::with_capacity(MAGIC_BATCH_SIZE);
+async fn mime_worker_libmagic_async(
+    mut rx: tokio_mpsc::Receiver<Vec<FileInfo>>,
+    tx: tokio_mpsc::Sender<Vec<FileInfo>>,
+) {
+    while let Some(batch) = rx.recv().await {
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            let result_batch = spawn_blocking(move || {
+                let cookie = Cookie::open(Flags::MIME | Flags::PRESERVE_ATIME)
+                    .expect("failed to open libmagic")
+                    .load(&Default::default())
+                    .expect("failed to load magic db");
+                let mut processed_batch = Vec::new();
+                for mut info in batch {
+                    info.file_type = cookie.file(&info.path).ok().or_else(|| {
+                        Path::new(&info.path)
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .map(|ext| format!("extension/{}", ext))
+                    });
+                    MIME_PROCESSED.fetch_add(1, Ordering::Relaxed);
+                    processed_batch.push(info);
+                }
+                processed_batch
+            })
+            .await
+            .unwrap();
+            let _ = tx_clone.send(result_batch).await;
+        });
+    }
+}
+
+async fn walk_and_stat(paths: Vec<String>, tx: tokio_mpsc::Sender<Vec<FileInfo>>) {
+    let mut batch = Vec::with_capacity(MAGIC_BATCH_SIZE);
+    for path in &paths {
+        for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+            if let Ok(metadata) = fs::metadata(entry.path()) {
+                if metadata.is_file() {
+                    let info = FileInfo {
+                        path: fs::canonicalize(entry.path())
+                            .unwrap_or_else(|_| entry.path().to_path_buf())
+                            .to_string_lossy()
+                            .to_string(),
+                        size: metadata.len(),
+                        time_created: metadata
+                            .created()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map_or(0, |t| t.as_secs()),
+                        time_modified: metadata
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map_or(0, |t| t.as_secs()),
+                        file_type: None,
+                    };
+                    batch.push(info);
+                    FILES_SCANNED.fetch_add(1, Ordering::Relaxed);
+                    if batch.len() >= MAGIC_BATCH_SIZE {
+                        if tx.send(batch.clone()).await.is_err() {
+                            break;
+                        }
+                        batch.clear();
+                    }
                 }
             }
         }
     }
     if !batch.is_empty() {
-        batch_tx.send(batch).unwrap();
+        let _ = tx.send(batch).await;
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
+    let backend = detect_backend(args.backend);
+    println!("Using backend: {:?}", backend);
+
     let mut conn = Connection::open(&args.db)?;
     create_table(&conn)?;
     conn.execute("PRAGMA synchronous = OFF", [])?;
     let _wal: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
 
-    let start_total = Instant::now();
+    let (progress_tx, mut progress_rx) = tokio_mpsc::channel::<()>(1);
 
-    // Channels
-    let (entry_tx, entry_rx) = mpsc::channel::<walkdir::DirEntry>();
-    let (magic_batch_tx, magic_batch_rx) = mpsc::channel::<Vec<FileInfo>>();
-    let (sqlite_tx, sqlite_rx) = mpsc::channel::<Vec<FileInfo>>();
+    let progress_handle = tokio::spawn(async move {
+        let mut stderr = stderr();
+        let _ = stderr.execute(cursor::Hide);
 
-    // Spawn magic worker
-    thread::spawn(move || magic_worker(magic_batch_rx, sqlite_tx));
+        while progress_rx.recv().await.is_some() {
+            let scanned = FILES_SCANNED.load(Ordering::Relaxed);
+            let mime = MIME_PROCESSED.load(Ordering::Relaxed);
+            let sqlite = SQLITE_INSERTED.load(Ordering::Relaxed);
 
-    // Spawn stat workers
-    let entry_rx = Arc::new(Mutex::new(entry_rx));
-    let mut handles = Vec::new();
-    let start_stat = Instant::now();
-    for _ in 0..STAT_THREADS {
-        let rx_clone = Arc::clone(&entry_rx);
-        let batch_tx_clone = magic_batch_tx.clone();
-        handles.push(thread::spawn(move || stat_worker(rx_clone, batch_tx_clone)));
-    }
+            let status = format!(
+                "Files scanned: {}  MIME processed: {}  SQLite inserted: {}",
+                scanned, mime, sqlite
+            );
 
-    // Walk directories in main thread
-    let start_walk = Instant::now();
-    let mut walk_count = 0;
-    for path in &args.paths {
-        for entry in WalkDir::new(path).into_iter().filter_map(Result::ok) {
-            walk_count += 1;
-            entry_tx.send(entry).unwrap();
+            let _ = stderr.queue(cursor::SavePosition);
+            let _ = stderr.queue(terminal::Clear(terminal::ClearType::CurrentLine));
+            let _ = stderr.queue(Print(status));
+            let _ = stderr.queue(cursor::RestorePosition);
+            let _ = stderr.flush();
         }
-    }
-    drop(entry_tx); // Close channel for stat workers
-    drop(magic_batch_tx); // Close batch channel after stat workers finish
-    println!(
-        "Directory walk done: {} entries in {:.2?}",
-        walk_count,
-        start_walk.elapsed()
-    );
 
-    for h in handles {
-        h.join().unwrap();
-    }
-    println!("Stat workers finished in {:.2?}", start_stat.elapsed());
+        let _ = stderr.execute(cursor::Show);
+        let _ = stderr.execute(terminal::Clear(terminal::ClearType::CurrentLine));
+    });
 
-    // SQLite insertion
-    let start_sqlite = Instant::now();
-    let tx = conn.transaction()?;
-    let mut sqlite_batch = Vec::with_capacity(SQLITE_BATCH_SIZE);
-    let mut total_inserted = 0;
-    for batch in sqlite_rx {
-        for info in batch {
-            sqlite_batch.push(info);
-            if sqlite_batch.len() >= SQLITE_BATCH_SIZE {
-                insert_batch(&tx, &sqlite_batch)?;
-                total_inserted += sqlite_batch.len();
-                sqlite_batch.clear();
+    let (mime_batch_tx, mime_batch_rx) = tokio_mpsc::channel::<Vec<FileInfo>>(CHANNEL_CAPACITY);
+    let (sqlite_tx, mut sqlite_rx) = tokio_mpsc::channel::<Vec<FileInfo>>(CHANNEL_CAPACITY);
+
+    let stat_handle = tokio::spawn({
+        let mime_batch_tx = mime_batch_tx.clone();
+        async move {
+            walk_and_stat(args.paths, mime_batch_tx).await;
+        }
+    });
+
+    // Clone the channels before moving them into the async blocks
+    let sqlite_tx_for_mime = sqlite_tx.clone();
+
+    let mime_handle = tokio::spawn({
+        let backend = backend.clone();
+        async move {
+            match backend {
+                MimeBackend::LibMagic => {
+                    mime_worker_libmagic_async(mime_batch_rx, sqlite_tx_for_mime).await
+                }
+                MimeBackend::FileCmd => {
+                    mime_worker_file_async(mime_batch_rx, sqlite_tx_for_mime).await
+                }
             }
         }
-    }
-    if !sqlite_batch.is_empty() {
-        insert_batch(&tx, &sqlite_batch)?;
-        total_inserted += sqlite_batch.len();
-    }
-    tx.commit()?;
-    println!(
-        "SQLite insertion finished {} files in {:.2?}",
-        total_inserted,
-        start_sqlite.elapsed()
+    });
+
+    let progress_tx_for_sqlite = progress_tx.clone();
+    let sqlite_handle = tokio::spawn(async move {
+        let mut sqlite_batch = Vec::with_capacity(SQLITE_BATCH_SIZE);
+        let mut total_inserted = 0;
+
+        while let Some(batch) = sqlite_rx.recv().await {
+            sqlite_batch.extend(batch);
+            if sqlite_batch.len() >= SQLITE_BATCH_SIZE {
+                if let Ok(tx) = conn.transaction() {
+                    if insert_batch(&tx, &sqlite_batch).is_ok() {
+                        tx.commit().ok();
+                        SQLITE_INSERTED.fetch_add(sqlite_batch.len(), Ordering::Relaxed);
+                        total_inserted += sqlite_batch.len();
+                    }
+                }
+                sqlite_batch.clear();
+            }
+            progress_tx_for_sqlite.send(()).await.ok();
+        }
+
+        if !sqlite_batch.is_empty() {
+            if let Ok(tx) = conn.transaction() {
+                if insert_batch(&tx, &sqlite_batch).is_ok() {
+                    tx.commit().ok();
+                    SQLITE_INSERTED.fetch_add(sqlite_batch.len(), Ordering::Relaxed);
+                    total_inserted += sqlite_batch.len();
+                }
+            }
+        }
+
+        total_inserted
+    });
+
+    // Periodically update progress
+    let progress_tx_for_update = progress_tx.clone();
+    let progress_update_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(200));
+        loop {
+            if progress_tx_for_update.send(()).await.is_err() {
+                break;
+            }
+            interval.tick().await;
+        }
+    });
+
+    let stat_result = stat_handle.await;
+
+    drop(mime_batch_tx);
+    let mime_result = mime_handle.await;
+
+    drop(sqlite_tx);
+    let sqlite_result = sqlite_handle.await;
+
+    progress_update_handle.abort();
+    drop(progress_tx); // Signal progress task to exit
+    let _ = progress_handle.await;
+    let scanned = FILES_SCANNED.load(Ordering::Relaxed);
+    let mime = MIME_PROCESSED.load(Ordering::Relaxed);
+    let sqlite = SQLITE_INSERTED.load(Ordering::Relaxed);
+    eprintln!(
+        "Files scanned: {} MIME processed: {} SQLite inserted: {}",
+        scanned, mime, sqlite
     );
 
-    println!("Total elapsed time: {:.2?}", start_total.elapsed());
+    if let Err(e) = stat_result {
+        eprintln!("Error in stat task: {:?}", e);
+    }
+    if let Err(e) = mime_result {
+        eprintln!("Error in MIME task: {:?}", e);
+    }
+    if let Err(e) = sqlite_result {
+        eprintln!("Error in SQLite task: {:?}", e);
+    }
+
     Ok(())
 }

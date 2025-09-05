@@ -12,5 +12,8 @@ homepage = "https://github.com/chapmanjacobd/library"
 clap = { version = "4.5", features = ["derive"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 walkdir = "2.5.0"
-rayon = "1.11.0"
 magic = "0.16.2"
+which = "8.0.0"
+tokio = { version = "1.47.1", features = ["process", "sync", "macros", "rt-multi-thread", "time"] }
+futures = "0.3.31"
+crossterm = "0.29.0"
