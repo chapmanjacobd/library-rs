@@ -32,16 +32,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install msys2
-        run: choco install mingw --no-progress -y
-
-      - name: Update MSYS2 package DB
-        run: pacman -Syuu --noconfirm
-        shell: 'C:\tools\msys64\usr\bin\bash.exe'
-
-      - name: Setup
-        run: pacman -S --needed --noconfirm mingw-w64-x86_64-file
-        shell: 'C:\tools\msys64\usr\bin\bash.exe'
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT
+          update: true
+          install: >
+            file
+            gcc
 
       - name: Build Windows binary
         run: cargo build --release --target x86_64-pc-windows-gnu
