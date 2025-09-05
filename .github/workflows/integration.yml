@@ -32,11 +32,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install deps
-        run: |
-          choco install mingw
-          refreshenv
-          pacman -Sy mingw-w64-x86_64-file
+      - name: Install msys2
+        run: choco install mingw --no-progress
+
+      - name: Install libmagic
+        run: pacman -Sy mingw-w64-x86_64-file
 
       - name: Build Windows binary
         run: cargo build --release --target x86_64-pc-windows-gnu
