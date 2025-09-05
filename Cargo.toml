@@ -2,6 +2,11 @@
 name = "library-rs"
 version = "0.1.0"
 edition = "2021"
+description = "Rust port of xklb's fsadd --fs"
+categories = ["command-line-utilities"]
+license = "BSD-3-Clause"
+repository = "https://github.com/chapmanjacobd/library-rs"
+homepage = "https://github.com/chapmanjacobd/library"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }

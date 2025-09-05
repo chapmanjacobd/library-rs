@@ -75,7 +75,7 @@ fn insert_batch(tx: &rusqlite::Transaction<'_>, batch: &[FileInfo]) -> Result<()
     Ok(())
 }
 
-/// Magic worker: processes batches sequentially
+/// processes batches sequentially
 fn magic_worker(rx: mpsc::Receiver<Vec<FileInfo>>, tx: mpsc::Sender<Vec<FileInfo>>) {
     let cookie = Cookie::open(Flags::MIME | Flags::PRESERVE_ATIME)
         .expect("failed to open libmagic")
@@ -105,7 +105,6 @@ fn magic_worker(rx: mpsc::Receiver<Vec<FileInfo>>, tx: mpsc::Sender<Vec<FileInfo
     );
 }
 
-/// Stat worker: collects FileInfo and sends batches
 fn stat_worker(
     entry_rx: Arc<Mutex<mpsc::Receiver<walkdir::DirEntry>>>,
     batch_tx: mpsc::Sender<Vec<FileInfo>>,
