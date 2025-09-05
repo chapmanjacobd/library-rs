@@ -16,7 +16,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libmagic-dev
 
       - name: Add Windows target
-        run: rustup target add x86_64-pc-windows-gnu
+        run: rustup toolchain install stable-x86_64-pc-windows-gnu
 
       - name: Build Linux binary
         run: cargo build --release
@@ -61,6 +61,8 @@ jobs:
 
       - name: Build macOS binary
         run: cargo build --release
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
@@ -79,16 +81,6 @@ jobs:
         with:
           path: ./artifacts
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            artifacts/library-rs-linux/library-rs
-            artifacts/library-rs-windows/library-rs.exe
-            artifacts/library-rs-macos/library-rs
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Install cargo-binstall
         run: cargo install cargo-binstall
 
@@ -97,5 +89,21 @@ jobs:
           VERSION=${GITHUB_REF#refs/tags/}
           cargo binstall package \
             --version $VERSION \
+            --version ${{ steps.version.outputs.version }} \
             --github-org ${{ github.repository_owner }} \
             --github-repo ${{ github.event.repository.name }}
+            --github-repo ${{ github.event.repository.name }} \
+            --output ./artifacts/library-rs-${{ steps.version.outputs.version }}.binstall.json
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: Release v${{ steps.version.outputs.version }}
+          files: |
+            artifacts/library-rs-linux/library-rs
+            artifacts/library-rs-windows/library-rs.exe
+            artifacts/library-rs-macos/library-rs
+            artifacts/library-rs-${{ steps.version.outputs.version }}.binstall.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
