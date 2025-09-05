@@ -37,7 +37,7 @@ jobs:
           msystem: UCRT64
           update: true
           install: >
-            mingw-w64-file
+            mingw-w64-ucrt-x86_64-file
 
       - name: Build Windows binary
         run: cargo build --release --target x86_64-pc-windows-gnu
