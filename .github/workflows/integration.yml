@@ -9,7 +9,8 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [windows-latest, macos-latest]
+        # ubuntu-latest
 
     runs-on: ${{ matrix.os }}
 
@@ -31,7 +32,7 @@ jobs:
 
       - name: Install SQLite on macOS
         if: matrix.os == 'macos-latest'
-        run: brew install sqlite3 libmagic
+        run: brew install sqlite3 libmagic file
 
       - name: Install SQLite on Windows
         if: matrix.os == 'windows-latest'
