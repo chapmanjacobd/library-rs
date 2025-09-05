@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main ]
     # tags:
-    #   - "v*" # e.g. v1.2.3
+    #   - "v*"
 
 jobs:
   build-linux:
@@ -13,16 +13,13 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y libmagic-dev gcc-mingw-w64-x86-64
-
-      - name: Add Windows target
-        run: rustup target add x86_64-pc-windows-gnu
+        run: sudo apt-get update && sudo apt-get install -y libmagic-dev
 
       - name: Build Linux binary
         run: cargo build --release
 
-      - name: Build Windows binary
-        run: cargo build --release --target x86_64-pc-windows-gnu
+      - name: Run tests
+        run: cargo test --verbose
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
@@ -30,33 +27,34 @@ jobs:
           name: library-rs-linux
           path: target/release/library-rs
 
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install deps
+        run: |
+          choco install mingw
+          pacman -Sy mingw-w64-x86_64-file
+
+      - name: Build Windows binary
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Run tests
+        run: cargo test --verbose
+
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: library-rs-windows
           path: target/x86_64-pc-windows-gnu/release/library-rs.exe
 
-  test-windows:
-    runs-on: windows-latest
-    needs: build-linux
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Download Windows artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: library-rs-windows
-          path: ./bin
-
-      - name: Run tests
-        run: ./bin/library-rs.exe --help
-
   build-macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install deps
+      - name: Install libmagic
         run: brew install libmagic
 
       - name: Build macOS binary
@@ -66,6 +64,9 @@ jobs:
           LIBRARY_PATH: /opt/homebrew/lib
           CPATH: /opt/homebrew/include
 
+      - name: Run tests
+        run: cargo test --verbose
+
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
@@ -74,7 +75,7 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    needs: [build-linux, test-windows, build-macos]
+    needs: [build-linux, build-windows, build-macos]
     steps:
       - uses: actions/checkout@v5
 
@@ -87,25 +88,24 @@ jobs:
         run: cargo install cargo-binstall
 
       - name: Generate binstall manifest
+        id: version
         run: |
-          VERSION=${GITHUB_REF#refs/tags/}
-          cargo binstall package \
-            --version $VERSION \
-            --version ${{ steps.version.outputs.version }} \
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          cargo binstall package --version $VERSION \
             --github-org ${{ github.repository_owner }} \
-            --github-repo ${{ github.event.repository.name }}
             --github-repo ${{ github.event.repository.name }} \
-            --output ./artifacts/library-rs-${{ steps.version.outputs.version }}.binstall.json
+            --output ./artifacts/library-rs-${VERSION}.binstall.json
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: Release v${{ steps.version.outputs.version }}
+          tag_name: ${{ github.ref }}
+          name: Release ${{ github.ref }}
           files: |
             artifacts/library-rs-linux/library-rs
             artifacts/library-rs-windows/library-rs.exe
             artifacts/library-rs-macos/library-rs
-            artifacts/library-rs-${{ steps.version.outputs.version }}.binstall.json
+            artifacts/library-rs-*.binstall.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
