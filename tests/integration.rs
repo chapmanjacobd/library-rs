@@ -5,11 +5,11 @@ use std::thread;
 use std::time::Duration;
 
 #[test]
-fn test_program_completes_and_db_has_rows_v2() -> Result<()> {
+fn test_program_completes() -> Result<()> {
     let db_path = "test.db";
     let _ = std::fs::remove_file(db_path);
 
-    let mut child = Command::new("./target/release/library-rs")
+    let mut child = Command::new("./target/debug/library-rs")
         .arg(db_path)
         .arg(".")
         .stdout(Stdio::piped())
