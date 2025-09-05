@@ -39,10 +39,9 @@ jobs:
           install: >
             mingw-w64-ucrt-x86_64-file
             mingw-w64-x86_64-file
-            mingw-w64-i686-file
 
       - name: Build Windows binary
-        run: cargo build --release --target x86_64-pc-windows-gnu --verbose
+        run: cargo build --release --target x86_64-pc-windows-gnu
         env:
           LIBRARY_PATH: 'C:\msys64\ucrt64\lib'
 
