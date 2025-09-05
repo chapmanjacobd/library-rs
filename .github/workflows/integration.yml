@@ -27,18 +27,18 @@ jobs:
 
       - name: Install SQLite on Linux
         if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get install -y sqlite3
+        run: sudo apt-get install -y sqlite3 libmagic-dev
 
       - name: Install SQLite on macOS
         if: matrix.os == 'macos-latest'
-        run: brew install sqlite3
+        run: brew install sqlite3 libmagic
 
       - name: Install SQLite on Windows
         if: matrix.os == 'windows-latest'
         run: choco install sqlite
 
       - name: Build
-        run: cargo build --verbose
+        run: cargo build
 
       - name: Run tests
         run: cargo test --verbose
