@@ -35,6 +35,7 @@ jobs:
       - name: Install deps
         run: |
           choco install mingw
+          refreshenv
           pacman -Sy mingw-w64-x86_64-file
 
       - name: Build Windows binary
@@ -51,6 +52,10 @@ jobs:
 
   build-macos:
     runs-on: macos-latest
+    env:
+      PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig
+      LIBRARY_PATH: /opt/homebrew/lib
+      CPATH: /opt/homebrew/include
     steps:
       - uses: actions/checkout@v5
 
@@ -59,10 +64,6 @@ jobs:
 
       - name: Build macOS binary
         run: cargo build --release
-        env:
-          PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig
-          LIBRARY_PATH: /opt/homebrew/lib
-          CPATH: /opt/homebrew/include
 
       - name: Run tests
         run: cargo test --verbose
