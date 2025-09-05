@@ -15,12 +15,15 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Set up Rust
-        uses: actions/setup-rust@v1
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          rust-version: stable
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Run Clippy
+        run: cargo clippy -- -D warnings
 
       - name: Install SQLite on Linux
         if: matrix.os == 'ubuntu-latest'
@@ -34,8 +37,8 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: choco install sqlite
 
-      - name: Build program
-        run: cargo build --release
+      - name: Build
+        run: cargo build --verbose
 
-      - name: Run integration test
-        run: cargo test --test integration -- --nocapture
+      - name: Run tests
+        run: cargo test --verbose
