@@ -38,6 +38,7 @@ jobs:
           update: true
           install: >
             mingw-w64-x86_64-file
+            mingw-w64-i686-file
 
       - name: Build Windows binary
         run: cargo build --release --target x86_64-pc-windows-gnu
