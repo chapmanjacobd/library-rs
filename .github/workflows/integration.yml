@@ -16,9 +16,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libmagic-dev gcc-mingw-w64-x86-64
 
       - name: Add Windows target
-        run: |
-          rustup target add x86_64-pc-windows-gnu
-          rustup toolchain install stable-x86_64-pc-windows-gnu
+        run: rustup target add x86_64-pc-windows-gnu
 
       - name: Build Linux binary
         run: cargo build --release
