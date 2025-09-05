@@ -34,7 +34,7 @@ jobs:
 
       - uses: msys2/setup-msys2@v2
         with:
-          msystem: MING64
+          msystem: MINGW64
           update: true
           install: >
             mingw-w64-x86_64-file
