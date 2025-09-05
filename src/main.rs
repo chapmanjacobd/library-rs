@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use crossterm::{cursor, style::Print, terminal, ExecutableCommand, QueueableCommand};
 use magic::cookie::Flags;
 use magic::Cookie;
@@ -6,33 +6,18 @@ use rusqlite::{params, Connection, Result};
 use std::fs;
 use std::io::{stderr, Write};
 use std::path::Path;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc,
-};
-use std::time::{Duration};
-use tokio::{
-    sync::{mpsc as tokio_mpsc, Semaphore},
-    task::spawn_blocking,
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::{sync::mpsc as tokio_mpsc, task::spawn_blocking};
 use walkdir::WalkDir;
-use which::which;
 
 const MAGIC_BATCH_SIZE: usize = 128;
 const SQLITE_BATCH_SIZE: usize = 32;
-const FILE_CMD_CONCURRENCY: usize = 16;
 const CHANNEL_CAPACITY: usize = 512;
 
-// static link libmagic for Windows
 #[cfg(target_os = "windows")]
 #[link(name = "magic", kind = "static")]
 extern "C" {}
-
-#[derive(ValueEnum, Clone, Debug)]
-enum BackendChoice {
-    File,
-    Magic,
-}
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -42,17 +27,8 @@ struct Args {
     #[clap(required = true, num_args = 1..)]
     paths: Vec<String>,
 
-    #[clap(long, value_enum)]
-    backend: Option<BackendChoice>,
-
     #[clap(long, default_value_t = 32)]
     stat_threads: usize,
-}
-
-#[derive(Debug, Clone)]
-enum MimeBackend {
-    LibMagic,
-    FileCmd,
 }
 
 #[derive(Debug, Clone)]
@@ -97,53 +73,6 @@ fn insert_batch(tx: &rusqlite::Transaction<'_>, batch: &[FileInfo]) -> Result<()
         ])?;
     }
     Ok(())
-}
-
-fn detect_backend(choice: Option<BackendChoice>) -> MimeBackend {
-    match choice {
-        Some(BackendChoice::File) => MimeBackend::FileCmd,
-        Some(BackendChoice::Magic) => MimeBackend::LibMagic,
-        None => {
-            if which("file").is_ok() {
-                MimeBackend::FileCmd
-            } else {
-                MimeBackend::LibMagic
-            }
-        }
-    }
-}
-
-async fn mime_worker_file_async(
-    mut rx: tokio_mpsc::Receiver<Vec<FileInfo>>,
-    tx: tokio_mpsc::Sender<Vec<FileInfo>>,
-) {
-    let sem = Arc::new(Semaphore::new(FILE_CMD_CONCURRENCY));
-    while let Some(batch) = rx.recv().await {
-        for info in batch {
-            let tx_clone = tx.clone();
-            let sem_clone = sem.clone();
-            tokio::spawn(async move {
-                let _permit = sem_clone.acquire().await.unwrap();
-                let result = spawn_blocking(move || {
-                    let mut info = info;
-                    if let Ok(output) = std::process::Command::new("file")
-                        .arg("-bi")
-                        .arg(&info.path)
-                        .output()
-                    {
-                        if let Ok(mime) = String::from_utf8(output.stdout) {
-                            info.file_type = Some(mime.trim().to_string());
-                        }
-                    }
-                    info
-                })
-                .await
-                .unwrap();
-                MIME_PROCESSED.fetch_add(1, Ordering::Relaxed);
-                let _ = tx_clone.send(vec![result]).await;
-            });
-        }
-    }
 }
 
 async fn mime_worker_libmagic_async(
@@ -222,8 +151,6 @@ async fn walk_and_stat(paths: Vec<String>, tx: tokio_mpsc::Sender<Vec<FileInfo>>
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let backend = detect_backend(args.backend);
-    println!("Using backend: {:?}", backend);
 
     let mut conn = Connection::open(&args.db)?;
     create_table(&conn)?;
@@ -234,6 +161,7 @@ async fn main() -> Result<()> {
 
     let progress_handle = tokio::spawn(async move {
         let mut stderr = stderr();
+        let _ = stderr.queue(cursor::SavePosition).unwrap();
         let _ = stderr.execute(cursor::Hide);
 
         while progress_rx.recv().await.is_some() {
@@ -246,15 +174,13 @@ async fn main() -> Result<()> {
                 scanned, mime, sqlite
             );
 
-            let _ = stderr.queue(cursor::SavePosition);
+            let _ = stderr.queue(cursor::RestorePosition);
             let _ = stderr.queue(terminal::Clear(terminal::ClearType::CurrentLine));
             let _ = stderr.queue(Print(status));
-            let _ = stderr.queue(cursor::RestorePosition);
             let _ = stderr.flush();
         }
 
         let _ = stderr.execute(cursor::Show);
-        let _ = stderr.execute(terminal::Clear(terminal::ClearType::CurrentLine));
     });
 
     let (mime_batch_tx, mime_batch_rx) = tokio_mpsc::channel::<Vec<FileInfo>>(CHANNEL_CAPACITY);
@@ -267,22 +193,12 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Clone the channels before moving them into the async blocks
     let sqlite_tx_for_mime = sqlite_tx.clone();
 
-    let mime_handle = tokio::spawn({
-        let backend = backend.clone();
-        async move {
-            match backend {
-                MimeBackend::LibMagic => {
-                    mime_worker_libmagic_async(mime_batch_rx, sqlite_tx_for_mime).await
-                }
-                MimeBackend::FileCmd => {
-                    mime_worker_file_async(mime_batch_rx, sqlite_tx_for_mime).await
-                }
-            }
-        }
-    });
+    let mime_handle =
+        tokio::spawn(
+            async move { mime_worker_libmagic_async(mime_batch_rx, sqlite_tx_for_mime).await },
+        );
 
     let progress_tx_for_sqlite = progress_tx.clone();
     let sqlite_handle = tokio::spawn(async move {
@@ -317,7 +233,6 @@ async fn main() -> Result<()> {
         total_inserted
     });
 
-    // Periodically update progress
     let progress_tx_for_update = progress_tx.clone();
     let progress_update_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(200));
@@ -338,15 +253,8 @@ async fn main() -> Result<()> {
     let sqlite_result = sqlite_handle.await;
 
     progress_update_handle.abort();
-    drop(progress_tx); // Signal progress task to exit
+    drop(progress_tx);
     let _ = progress_handle.await;
-    let scanned = FILES_SCANNED.load(Ordering::Relaxed);
-    let mime = MIME_PROCESSED.load(Ordering::Relaxed);
-    let sqlite = SQLITE_INSERTED.load(Ordering::Relaxed);
-    eprintln!(
-        "Files scanned: {} MIME processed: {} SQLite inserted: {}",
-        scanned, mime, sqlite
-    );
 
     if let Err(e) = stat_result {
         eprintln!("Error in stat task: {:?}", e);
