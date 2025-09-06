@@ -22,9 +22,6 @@ struct Args {
 
     #[clap(required = true, num_args = 1..)]
     paths: Vec<String>,
-
-    #[clap(long, default_value_t = 32)]
-    stat_threads: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +72,8 @@ async fn mime_worker_libmagic_async(
     mut rx: tokio_mpsc::Receiver<Vec<FileInfo>>,
     tx: tokio_mpsc::Sender<Vec<FileInfo>>,
 ) {
+    // https://github.com/robo9k/rust-magic-sys/issues/28
+    // TODO: maybe use glommio
     while let Some(batch) = rx.recv().await {
         let tx_clone = tx.clone();
         tokio::spawn(async move {
@@ -83,6 +82,7 @@ async fn mime_worker_libmagic_async(
                     .expect("failed to open libmagic")
                     .load(&Default::default())
                     .expect("failed to load magic db");
+
                 let mut processed_batch = Vec::new();
                 for mut info in batch {
                     info.file_type = cookie.file(&info.path).ok().or_else(|| {

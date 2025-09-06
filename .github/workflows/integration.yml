@@ -32,10 +32,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: robo9k/rust-magic-sys/.github/actions/setup-libmagic@main
+
       - name: Build Windows binary
         run: cargo build --release
         env:
           LIBMAGIC_STATIC: true
+          VCPKG_ROOT: 'C:\vcpkg'
 
       - name: Run tests
         run: cargo test --verbose
