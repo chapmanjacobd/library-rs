@@ -1,7 +1,5 @@
 use clap::Parser;
 use crossterm::{cursor, style::Print, terminal, ExecutableCommand, QueueableCommand};
-use magic::cookie::Flags;
-use magic::Cookie;
 use rusqlite::{params, Connection, Result};
 use std::fs;
 use std::io::{stderr, Write};
@@ -10,6 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::{sync::mpsc as tokio_mpsc, task::spawn_blocking};
 use walkdir::WalkDir;
+use tree_magic_mini as tree_magic;
 
 const MAGIC_BATCH_SIZE: usize = 128;
 const SQLITE_BATCH_SIZE: usize = 32;
@@ -67,30 +66,17 @@ fn insert_batch(tx: &rusqlite::Transaction<'_>, batch: &[FileInfo]) -> Result<()
     }
     Ok(())
 }
-
-async fn mime_worker_libmagic_async(
+async fn mime_worker_tree_magic_async(
     mut rx: tokio_mpsc::Receiver<Vec<FileInfo>>,
     tx: tokio_mpsc::Sender<Vec<FileInfo>>,
 ) {
-    // https://github.com/robo9k/rust-magic-sys/issues/28
-    // TODO: maybe use glommio
     while let Some(batch) = rx.recv().await {
         let tx_clone = tx.clone();
         tokio::spawn(async move {
-            let result_batch = spawn_blocking(move || {
-                let cookie = Cookie::open(Flags::MIME | Flags::PRESERVE_ATIME)
-                    .expect("failed to open libmagic")
-                    .load(&Default::default())
-                    .expect("failed to load magic db");
-
+            let processed_batch = spawn_blocking(move || {
                 let mut processed_batch = Vec::new();
                 for mut info in batch {
-                    info.file_type = cookie.file(&info.path).ok().or_else(|| {
-                        Path::new(&info.path)
-                            .extension()
-                            .and_then(|ext| ext.to_str())
-                            .map(|ext| format!("extension/{}", ext))
-                    });
+                    info.file_type = tree_magic::from_filepath(Path::new(&info.path)).map(|s| s.to_string());
                     MIME_PROCESSED.fetch_add(1, Ordering::Relaxed);
                     processed_batch.push(info);
                 }
@@ -98,7 +84,7 @@ async fn mime_worker_libmagic_async(
             })
             .await
             .unwrap();
-            let _ = tx_clone.send(result_batch).await;
+            let _ = tx_clone.send(processed_batch).await;
         });
     }
 }
@@ -194,10 +180,9 @@ async fn main() -> Result<()> {
 
     let sqlite_tx_for_mime = sqlite_tx.clone();
 
-    let mime_handle =
-        tokio::spawn(
-            async move { mime_worker_libmagic_async(mime_batch_rx, sqlite_tx_for_mime).await },
-        );
+    let mime_handle = tokio::spawn(async move {
+        mime_worker_tree_magic_async(mime_batch_rx, sqlite_tx_for_mime).await
+    });
 
     let progress_tx_for_sqlite = progress_tx.clone();
     let sqlite_handle = tokio::spawn(async move {
