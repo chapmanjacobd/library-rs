@@ -15,10 +15,6 @@ const MAGIC_BATCH_SIZE: usize = 128;
 const SQLITE_BATCH_SIZE: usize = 32;
 const CHANNEL_CAPACITY: usize = 512;
 
-#[cfg(target_os = "windows")]
-#[link(name = "magic", kind = "static")]
-extern "C" {}
-
 #[derive(Parser, Debug)]
 struct Args {
     #[clap(required = true)]

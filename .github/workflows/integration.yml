@@ -34,42 +34,42 @@ jobs:
           name: library-rs-linux
           path: target/release/library-rs
 
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v5
+  # build-windows:
+  #   runs-on: windows-latest
+  #   steps:
+  #     - uses: actions/checkout@v5
 
-      - name: Install deps
-        run: |
-          vcpkg update
-          vcpkg install libmagic
-          vcpkg install --no-print-usage pkgconf
-        shell: bash
-        env:
-          VCPKG_ROOT: 'C:\vcpkg'
-          VCPKG_INSTALLATION_ROOT: ${VCPKG_INSTALLATION_ROOT}
-          VCPKG_DEFAULT_TRIPLET: x64-windows-static-md
-          VCPKG_TRIPLET: x64-windows
+  #     - name: Install deps
+  #       run: |
+  #         vcpkg update
+  #         vcpkg install libmagic
+  #         vcpkg install --no-print-usage pkgconf
+  #       shell: bash
+  #       env:
+  #         VCPKG_ROOT: 'C:\vcpkg'
+  #         VCPKG_INSTALLATION_ROOT: ${VCPKG_INSTALLATION_ROOT}
+  #         VCPKG_DEFAULT_TRIPLET: x64-windows-static-md
+  #         VCPKG_TRIPLET: x64-windows
 
-      - name: Build Windows binary
-        run: |
-          cargo build
-          cargo build --release
-        env:
-          LIBMAGIC_STATIC: 1
-          VCPKG_ROOT: 'C:\vcpkg'
+  #     - name: Build Windows binary
+  #       run: |
+  #         cargo build
+  #         cargo build --release
+  #       env:
+  #         LIBMAGIC_STATIC: 1
+  #         VCPKG_ROOT: 'C:\vcpkg'
 
-      - name: Run tests
-        run: cargo test --verbose
-        env:
-          LIBMAGIC_STATIC: 1
-          VCPKG_ROOT: 'C:\vcpkg'
+  #     - name: Run tests
+  #       run: cargo test --verbose
+  #       env:
+  #         LIBMAGIC_STATIC: 1
+  #         VCPKG_ROOT: 'C:\vcpkg'
 
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: library-rs-windows
-          path: target/release/library-rs
+  #     - name: Upload Windows artifact
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: library-rs-windows
+  #         path: target/release/library-rs
 
   build-macos:
     runs-on: macos-latest
@@ -96,40 +96,3 @@ jobs:
         with:
           name: library-rs-macos
           path: target/release/library-rs
-
-  release:
-    runs-on: ubuntu-latest
-    needs: [build-linux, build-macos]  # build-windows,
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./artifacts
-
-      # - name: Install cargo-binstall
-      #   run: cargo install cargo-binstall
-
-      # - name: Generate binstall manifest
-      #   id: version
-      #   run: |
-      #     VERSION=${GITHUB_REF#refs/tags/v}
-      #     echo "version=$VERSION" >> $GITHUB_OUTPUT
-      #     cargo binstall package --version $VERSION \
-      #       --github-org ${{ github.repository_owner }} \
-      #       --github-repo ${{ github.event.repository.name }} \
-      #       --output ./artifacts/library-rs-${VERSION}.binstall.json
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ github.ref }}
-          name: Release ${{ github.ref }}
-          files: |
-            artifacts/library-rs-linux/library-rs
-            artifacts/library-rs-windows/library-rs
-            artifacts/library-rs-macos/library-rs
-            artifacts/library-rs-*.binstall.json
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
