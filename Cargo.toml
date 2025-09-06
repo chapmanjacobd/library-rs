@@ -1,6 +1,6 @@
 [package]
 name = "library-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Rust port of xklb's fsadd --fs"
 categories = ["command-line-utilities"]
