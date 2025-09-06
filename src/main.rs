@@ -105,15 +105,18 @@ async fn mime_worker_libmagic_async(
 
 async fn walk_and_stat(paths: Vec<String>, tx: tokio_mpsc::Sender<Vec<FileInfo>>) {
     let mut batch = Vec::with_capacity(MAGIC_BATCH_SIZE);
-    for path in &paths {
-        for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
+
+    let canon_paths: Vec<PathBuf> = paths
+        .into_iter()
+        .map(|p| fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(p)))
+        .collect();
+
+    for root in &canon_paths {
+        for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
             if let Ok(metadata) = fs::metadata(entry.path()) {
                 if metadata.is_file() {
                     let info = FileInfo {
-                        path: fs::canonicalize(entry.path())
-                            .unwrap_or_else(|_| entry.path().to_path_buf())
-                            .to_string_lossy()
-                            .to_string(),
+                        path: entry.path().to_string_lossy().to_string(),
                         size: metadata.len(),
                         time_created: metadata
                             .created()
