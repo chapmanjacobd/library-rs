@@ -32,12 +32,22 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: robo9k/rust-magic-sys/.github/actions/setup-libmagic@main
+      - run: |
+          git -C "${VCPKG_INSTALLATION_ROOT}" pull
+          vcpkg update
+          vcpkg install libmagic
+          vcpkg install --no-print-usage pkgconf
+        shell: bash
+        env:
+          VCPKG_ROOT: 'C:\vcpkg'
+          VCPKG_INSTALLATION_ROOT: ${VCPKG_INSTALLATION_ROOT}
+          VCPKG_DEFAULT_TRIPLET: x64-windows-static-md
+          VCPKG_TRIPLET: x64-windows
 
       - name: Build Windows binary
         run: cargo build --release
         env:
-          LIBMAGIC_STATIC: true
+          LIBMAGIC_STATIC: 1
           VCPKG_ROOT: 'C:\vcpkg'
 
       - name: Run tests
