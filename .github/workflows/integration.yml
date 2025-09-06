@@ -33,7 +33,6 @@ jobs:
       - uses: actions/checkout@v5
 
       - run: |
-          git -C "${VCPKG_INSTALLATION_ROOT}" pull
           vcpkg update
           vcpkg install libmagic
           vcpkg install --no-print-usage pkgconf
