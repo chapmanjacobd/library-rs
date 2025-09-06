@@ -5,7 +5,7 @@ use magic::Cookie;
 use rusqlite::{params, Connection, Result};
 use std::fs;
 use std::io::{stderr, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::{sync::mpsc as tokio_mpsc, task::spawn_blocking};
@@ -14,6 +14,10 @@ use walkdir::WalkDir;
 const MAGIC_BATCH_SIZE: usize = 128;
 const SQLITE_BATCH_SIZE: usize = 32;
 const CHANNEL_CAPACITY: usize = 512;
+
+#[cfg(target_os = "windows")]
+#[link(name = "magic", kind = "static")]
+extern "C" {}
 
 #[derive(Parser, Debug)]
 struct Args {
