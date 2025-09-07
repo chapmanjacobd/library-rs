@@ -69,7 +69,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: library-rs-windows
-          path: target/release/library-rs
+          path: 'target\release\library-rs.exe'
 
   build-macos:
     runs-on: macos-latest
