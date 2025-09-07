@@ -12,8 +12,9 @@ homepage = "https://github.com/chapmanjacobd/library"
 clap = { version = "4.5", features = ["derive"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 walkdir = "2.5.0"
-which = "8.0.0"
-tokio = { version = "1.47.1", features = ["process", "sync", "macros", "rt-multi-thread", "time"] }
-futures = "0.3.31"
-crossterm = "0.29.0"
-tree_magic_mini = "3.2.0"
+tokio = { version = "1.47.1", features = ["process", "sync", "macros", "rt-multi-thread", "time", "tracing"] }
+tree_magic_mini = { version = "3.2.0", features = ["with-gpl-data"] }
+tracing-indicatif = "0.3.13"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tracing = "0.1.41"
+indicatif = "0.18.0"

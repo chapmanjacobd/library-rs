@@ -1,18 +1,20 @@
 use clap::Parser;
-use crossterm::{cursor, style::Print, terminal, ExecutableCommand, QueueableCommand};
-use rusqlite::{params, Connection, Result};
+use indicatif::{HumanCount, MultiProgress, ProgressBar, ProgressStyle};
+use rusqlite::{params, Connection};
 use std::fs;
-use std::io::{stderr, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
-use tokio::{sync::mpsc as tokio_mpsc, task::spawn_blocking};
-use walkdir::WalkDir;
+use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::{mpsc as tokio_mpsc, Mutex};
+use tracing::{error, info};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use tree_magic_mini as tree_magic;
+use walkdir::WalkDir;
 
-const MAGIC_BATCH_SIZE: usize = 128;
-const SQLITE_BATCH_SIZE: usize = 32;
+const MIME_WORKERS: usize = 4;
 const CHANNEL_CAPACITY: usize = 512;
+const SQLITE_BATCH_SIZE: usize = 32;
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -21,6 +23,9 @@ struct Args {
 
     #[clap(required = true, num_args = 1..)]
     paths: Vec<String>,
+
+    #[clap(long)]
+    no_progress: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -31,10 +36,6 @@ struct FileInfo {
     time_modified: u64,
     file_type: Option<String>,
 }
-
-static FILES_SCANNED: AtomicUsize = AtomicUsize::new(0);
-static MIME_PROCESSED: AtomicUsize = AtomicUsize::new(0);
-static SQLITE_INSERTED: AtomicUsize = AtomicUsize::new(0);
 
 fn create_table(conn: &Connection) -> Result<()> {
     conn.execute(
@@ -53,7 +54,7 @@ fn create_table(conn: &Connection) -> Result<()> {
 
 fn insert_batch(tx: &rusqlite::Transaction<'_>, batch: &[FileInfo]) -> Result<()> {
     let mut stmt = tx.prepare(
-        "INSERT OR REPLACE INTO media (path, size, time_created, time_modified, type) VALUES (?, ?, ?, ?, ?)"
+        "INSERT OR REPLACE INTO media (path, size, time_created, time_modified, type) VALUES (?, ?, ?, ?, ?)",
     )?;
     for file in batch {
         stmt.execute(params![
@@ -66,189 +67,222 @@ fn insert_batch(tx: &rusqlite::Transaction<'_>, batch: &[FileInfo]) -> Result<()
     }
     Ok(())
 }
-async fn mime_worker_tree_magic_async(
-    mut rx: tokio_mpsc::Receiver<Vec<FileInfo>>,
-    tx: tokio_mpsc::Sender<Vec<FileInfo>>,
-) {
-    while let Some(batch) = rx.recv().await {
-        let tx_clone = tx.clone();
-        tokio::spawn(async move {
-            let processed_batch = spawn_blocking(move || {
-                let mut processed_batch = Vec::new();
-                for mut info in batch {
-                    info.file_type = tree_magic::from_filepath(Path::new(&info.path)).map(|s| s.to_string());
-                    MIME_PROCESSED.fetch_add(1, Ordering::Relaxed);
-                    processed_batch.push(info);
-                }
-                processed_batch
-            })
-            .await
-            .unwrap();
-            let _ = tx_clone.send(processed_batch).await;
-        });
-    }
-}
 
-async fn walk_and_stat(paths: Vec<String>, tx: tokio_mpsc::Sender<Vec<FileInfo>>) {
-    let mut batch = Vec::with_capacity(MAGIC_BATCH_SIZE);
-
-    let canon_paths: Vec<PathBuf> = paths
-        .into_iter()
-        .map(|p| fs::canonicalize(&p).unwrap_or_else(|_| PathBuf::from(p)))
-        .collect();
-
-    for root in &canon_paths {
-        for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-            if let Ok(metadata) = fs::metadata(entry.path()) {
-                if metadata.is_file() {
-                    let info = FileInfo {
-                        path: entry.path().to_string_lossy().to_string(),
-                        size: metadata.len(),
-                        time_created: metadata
-                            .created()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map_or(0, |t| t.as_secs()),
-                        time_modified: metadata
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map_or(0, |t| t.as_secs()),
-                        file_type: None,
-                    };
-                    batch.push(info);
-                    FILES_SCANNED.fetch_add(1, Ordering::Relaxed);
-                    if batch.len() >= MAGIC_BATCH_SIZE {
-                        if tx.send(batch.clone()).await.is_err() {
-                            break;
+async fn walk_and_stat(
+    paths: Vec<String>,
+    tx: tokio_mpsc::Sender<FileInfo>,
+    pb: ProgressBar,
+) -> Result<()> {
+    for root in paths {
+        match fs::canonicalize(&root) {
+            Ok(canon_root) => {
+                for entry in WalkDir::new(canon_root).into_iter().filter_map(|e| e.ok()) {
+                    if let Ok(metadata) = fs::metadata(entry.path()) {
+                        if metadata.is_file() {
+                            let info = FileInfo {
+                                path: entry.path().to_string_lossy().to_string(),
+                                size: metadata.len(),
+                                time_created: metadata
+                                    .created()
+                                    .ok()
+                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                    .map_or(0, |t| t.as_secs()),
+                                time_modified: metadata
+                                    .modified()
+                                    .ok()
+                                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                    .map_or(0, |t| t.as_secs()),
+                                file_type: None,
+                            };
+                            pb.inc(1);
+                            if tx.send(info).await.is_err() {
+                                error!("Receiver for MIME worker is closed, stopping walk.");
+                                break;
+                            }
                         }
-                        batch.clear();
                     }
                 }
             }
+            Err(e) => {
+                error!("Failed to canonicalize path {:?}: {}", root, e);
+                continue;
+            }
         }
     }
-    if !batch.is_empty() {
-        let _ = tx.send(batch).await;
+    pb.finish_with_message("Scan complete");
+    Ok(())
+}
+
+async fn mime_worker(
+    rx: Arc<Mutex<tokio_mpsc::Receiver<FileInfo>>>,
+    tx: tokio_mpsc::Sender<FileInfo>,
+    pb: ProgressBar,
+) -> Result<()> {
+    loop {
+        let maybe_info = { rx.lock().await.recv().await };
+        match maybe_info {
+            Some(mut info) => {
+                info.file_type =
+                    tree_magic::from_filepath(Path::new(&info.path)).map(|s| s.to_string());
+                pb.inc(1);
+                if tx.send(info).await.is_err() {
+                    error!("Receiver for SQLite worker is closed, stopping MIME processing.");
+                    break;
+                }
+            }
+            None => break,
+        }
     }
+    pb.finish_with_message("MIME complete");
+    Ok(())
+}
+
+async fn sqlite_worker(
+    db_path: String,
+    mut rx: tokio_mpsc::Receiver<FileInfo>,
+    pb: ProgressBar,
+) -> Result<()> {
+    let mut conn = Connection::open(&db_path)?;
+    conn.execute("PRAGMA synchronous = OFF", [])?;
+    let _wal: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+    create_table(&conn)?;
+
+    let mut batch = Vec::with_capacity(SQLITE_BATCH_SIZE);
+    while let Some(file_info) = rx.recv().await {
+        batch.push(file_info);
+        if batch.len() >= SQLITE_BATCH_SIZE {
+            let tx = conn.transaction()?;
+            if insert_batch(&tx, &batch).is_ok() {
+                tx.commit()?;
+                pb.inc(batch.len() as u64);
+            }
+            batch.clear();
+        }
+    }
+
+    if !batch.is_empty() {
+        let tx = conn.transaction()?;
+        if insert_batch(&tx, &batch).is_ok() {
+            tx.commit()?;
+            pb.inc(batch.len() as u64);
+        }
+    }
+    pb.finish_with_message("SQLite complete");
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let mut conn = Connection::open(&args.db)?;
-    create_table(&conn)?;
-    conn.execute("PRAGMA synchronous = OFF", [])?;
-    let _wal: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+    fmt::Subscriber::builder()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .finish()
+        .init();
 
-    let (progress_tx, mut progress_rx) = tokio_mpsc::channel::<()>(1);
+    info!("Starting file scanner with db: {}", args.db);
 
-    let progress_handle = tokio::spawn(async move {
-        let mut stderr = stderr();
-        let _ = stderr.queue(cursor::SavePosition).unwrap();
-        let _ = stderr.execute(cursor::Hide);
-
-        while progress_rx.recv().await.is_some() {
-            let scanned = FILES_SCANNED.load(Ordering::Relaxed);
-            let mime = MIME_PROCESSED.load(Ordering::Relaxed);
-            let sqlite = SQLITE_INSERTED.load(Ordering::Relaxed);
-
-            let status = format!(
-                "Files scanned: {}  MIME processed: {}  SQLite inserted: {}",
-                scanned, mime, sqlite
-            );
-
-            let _ = stderr.queue(cursor::RestorePosition);
-            let _ = stderr.queue(terminal::Clear(terminal::ClearType::CurrentLine));
-            let _ = stderr.queue(Print(status));
-            let _ = stderr.flush();
-        }
-
-        let _ = stderr.execute(cursor::Show);
-    });
-
-    let (mime_batch_tx, mime_batch_rx) = tokio_mpsc::channel::<Vec<FileInfo>>(CHANNEL_CAPACITY);
-    let (sqlite_tx, mut sqlite_rx) = tokio_mpsc::channel::<Vec<FileInfo>>(CHANNEL_CAPACITY);
-
-    let stat_handle = tokio::spawn({
-        let mime_batch_tx = mime_batch_tx.clone();
-        async move {
-            walk_and_stat(args.paths, mime_batch_tx).await;
-        }
-    });
-
-    let sqlite_tx_for_mime = sqlite_tx.clone();
-
-    let mime_handle = tokio::spawn(async move {
-        mime_worker_tree_magic_async(mime_batch_rx, sqlite_tx_for_mime).await
-    });
-
-    let progress_tx_for_sqlite = progress_tx.clone();
-    let sqlite_handle = tokio::spawn(async move {
-        let mut sqlite_batch = Vec::with_capacity(SQLITE_BATCH_SIZE);
-        let mut total_inserted = 0;
-
-        while let Some(batch) = sqlite_rx.recv().await {
-            sqlite_batch.extend(batch);
-            if sqlite_batch.len() >= SQLITE_BATCH_SIZE {
-                if let Ok(tx) = conn.transaction() {
-                    if insert_batch(&tx, &sqlite_batch).is_ok() {
-                        tx.commit().ok();
-                        SQLITE_INSERTED.fetch_add(sqlite_batch.len(), Ordering::Relaxed);
-                        total_inserted += sqlite_batch.len();
+    // Pre-pass to count total files with optional progress
+    let total_files: u64 = if args.no_progress {
+        let mut count = 0;
+        for root in &args.paths {
+            if let Ok(canon_root) = fs::canonicalize(root) {
+                for entry in WalkDir::new(canon_root).into_iter().filter_map(|e| e.ok()) {
+                    if let Ok(metadata) = fs::metadata(entry.path()) {
+                        if metadata.is_file() {
+                            count += 1;
+                        }
                     }
                 }
-                sqlite_batch.clear();
             }
-            progress_tx_for_sqlite.send(()).await.ok();
         }
+        info!("Total files to process: {}", count);
+        count
+    } else {
+        let mp_count = MultiProgress::new();
+        let count_pb = mp_count.add(ProgressBar::new(u64::MAX)); // indeterminate large number
+        count_pb.set_style(ProgressStyle::with_template("{msg}")?);
+        count_pb.set_message("Counting files...");
 
-        if !sqlite_batch.is_empty() {
-            if let Ok(tx) = conn.transaction() {
-                if insert_batch(&tx, &sqlite_batch).is_ok() {
-                    tx.commit().ok();
-                    SQLITE_INSERTED.fetch_add(sqlite_batch.len(), Ordering::Relaxed);
-                    total_inserted += sqlite_batch.len();
+        let paths = args.paths.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let mut count = 0u64;
+            for root in &paths {
+                if let Ok(canon_root) = fs::canonicalize(root) {
+                    for entry in WalkDir::new(canon_root).into_iter().filter_map(|e| e.ok()) {
+                        if let Ok(metadata) = fs::metadata(entry.path()) {
+                            if metadata.is_file() {
+                                count += 1;
+                                if count % 50 == 0 {
+                                    count_pb.set_message(format!(
+                                        "Counting {} files...",
+                                        HumanCount(count)
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 }
             }
-        }
+            count_pb.finish_with_message(format!("Counted {} files", HumanCount(count)));
+            count
+        });
 
-        total_inserted
-    });
+        handle.await?
+    };
 
-    let progress_tx_for_update = progress_tx.clone();
-    let progress_update_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(200));
-        loop {
-            if progress_tx_for_update.send(()).await.is_err() {
-                break;
-            }
-            interval.tick().await;
-        }
-    });
+    // Setup main progress bars
+    let style = ProgressStyle::with_template(
+        "{spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({percent}%) {msg}",
+    )?
+    .progress_chars("#>-");
 
-    let stat_result = stat_handle.await;
+    let (walk_pb, mime_pb, sqlite_pb);
+    let _ = if args.no_progress {
+        walk_pb = ProgressBar::hidden();
+        mime_pb = ProgressBar::hidden();
+        sqlite_pb = ProgressBar::hidden();
+        None
+    } else {
+        let mp = MultiProgress::new();
+        walk_pb = mp.add(ProgressBar::new(total_files).with_style(style.clone()));
+        walk_pb.set_message("Scanning files...");
 
-    drop(mime_batch_tx);
-    let mime_result = mime_handle.await;
+        mime_pb = mp.add(ProgressBar::new(total_files).with_style(style.clone()));
+        mime_pb.set_message("Detecting MIME types...");
 
-    drop(sqlite_tx);
-    let sqlite_result = sqlite_handle.await;
+        sqlite_pb = mp.add(ProgressBar::new(total_files).with_style(style.clone()));
+        sqlite_pb.set_message("Inserting into SQLite...");
 
-    progress_update_handle.abort();
-    drop(progress_tx);
-    let _ = progress_handle.await;
+        Some(mp)
+    };
 
-    if let Err(e) = stat_result {
-        eprintln!("Error in stat task: {:?}", e);
+    let (walk_tx, mime_rx) = tokio_mpsc::channel(CHANNEL_CAPACITY);
+    let (mime_tx, sqlite_rx) = tokio_mpsc::channel(CHANNEL_CAPACITY);
+    let mime_rx = Arc::new(Mutex::new(mime_rx));
+
+    let walk_handle = tokio::spawn(walk_and_stat(args.paths.clone(), walk_tx, walk_pb.clone()));
+
+    let mime_handles: Vec<_> = (0..MIME_WORKERS)
+        .map(|_| {
+            let rx = Arc::clone(&mime_rx);
+            let tx = mime_tx.clone();
+            let pb = mime_pb.clone();
+            tokio::spawn(mime_worker(rx, tx, pb))
+        })
+        .collect();
+
+    let sqlite_handle = tokio::spawn(sqlite_worker(args.db.clone(), sqlite_rx, sqlite_pb.clone()));
+
+    drop(mime_tx);
+
+    // Await tasks
+    let _ = walk_handle.await;
+    for h in mime_handles {
+        let _ = h.await;
     }
-    if let Err(e) = mime_result {
-        eprintln!("Error in MIME task: {:?}", e);
-    }
-    if let Err(e) = sqlite_result {
-        eprintln!("Error in SQLite task: {:?}", e);
-    }
+    let _ = sqlite_handle.await;
 
     Ok(())
 }
