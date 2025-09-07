@@ -34,42 +34,42 @@ jobs:
           name: library-rs-linux
           path: target/release/library-rs
 
-  # build-windows:
-  #   runs-on: windows-latest
-  #   steps:
-  #     - uses: actions/checkout@v5
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
 
-  #     - name: Install deps
-  #       run: |
-  #         vcpkg update
-  #         vcpkg install libmagic
-  #         vcpkg install --no-print-usage pkgconf
-  #       shell: bash
-  #       env:
-  #         VCPKG_ROOT: 'C:\vcpkg'
-  #         VCPKG_INSTALLATION_ROOT: ${VCPKG_INSTALLATION_ROOT}
-  #         VCPKG_DEFAULT_TRIPLET: x64-windows-static-md
-  #         VCPKG_TRIPLET: x64-windows
+      # - name: Install deps
+      #   run: |
+      #     vcpkg update
+      #     vcpkg install libmagic
+      #     vcpkg install --no-print-usage pkgconf
+      #   shell: bash
+      #   env:
+      #     VCPKG_ROOT: 'C:\vcpkg'
+      #     VCPKG_INSTALLATION_ROOT: ${VCPKG_INSTALLATION_ROOT}
+      #     VCPKG_DEFAULT_TRIPLET: x64-windows-static-md
+      #     VCPKG_TRIPLET: x64-windows
 
-  #     - name: Build Windows binary
-  #       run: |
-  #         cargo build
-  #         cargo build --release
-  #       env:
-  #         LIBMAGIC_STATIC: 1
-  #         VCPKG_ROOT: 'C:\vcpkg'
+      - name: Build Windows binary
+        run: |
+          cargo build
+          cargo build --release
+        env:
+          LIBMAGIC_STATIC: 1
+          VCPKG_ROOT: 'C:\vcpkg'
 
-  #     - name: Run tests
-  #       run: cargo test --verbose
-  #       env:
-  #         LIBMAGIC_STATIC: 1
-  #         VCPKG_ROOT: 'C:\vcpkg'
+      - name: Run tests
+        run: cargo test --verbose
+        env:
+          LIBMAGIC_STATIC: 1
+          VCPKG_ROOT: 'C:\vcpkg'
 
-  #     - name: Upload Windows artifact
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: library-rs-windows
-  #         path: target/release/library-rs
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: library-rs-windows
+          path: target/release/library-rs
 
   build-macos:
     runs-on: macos-latest
